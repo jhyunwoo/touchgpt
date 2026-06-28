@@ -10,7 +10,7 @@
  * HOW TO USE
  *   1) Log into Touchgym, open the member page (https://wN.touchgym.co.kr/m/member/...).
  *   2) Set SEQ below to the SAME member seq the worker polls (TOUCHGYM_SEQ).
- *   3) Paste this whole file into the DevTools Console.
+ *   3) Paste this whole file into the DevTools Console (or load via base64, see install-via-memo.md).
  *   4) ask("오늘 서울 날씨 알려줘")
  */
 (() => {
