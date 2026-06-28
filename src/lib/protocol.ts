@@ -96,13 +96,27 @@ function retentionCutoffMs(now = Date.now()): number {
   return startOfTodayKst - 86_400_000; // include yesterday
 }
 
-/** Drop our messages older than the 2-day window; keep human lines untouched. */
+// Touchgym's memo field is a MySQL TEXT column (max 65535 bytes); a write that
+// exceeds it gets truncated, silently dropping the newest line. Keep our part
+// of the memo well under that so new questions always fit.
+const MEMO_BUDGET = 16000;
+
+/** Keep recent messages within the 2-day window AND a byte budget (newest
+ *  first), so the memo never approaches Touchgym's field limit. Human lines
+ *  are preserved untouched. */
 export function pruneMemo(memo: string, now = Date.now()): string {
   const cutoff = retentionCutoffMs(now);
   const { msgs, others } = parseMemo(memo);
-  const kept = msgs
-    .filter((m) => m.ts >= cutoff)
-    .map((m) => makeLine(m.id, m.kind, m.payload, m.ts));
+  const within = msgs.filter((m) => m.ts >= cutoff).sort((a, b) => b.ts - a.ts);
+  const keptNewestFirst: Msg[] = [];
+  let used = 0;
+  for (const m of within) {
+    const line = makeLine(m.id, m.kind, m.payload, m.ts);
+    if (keptNewestFirst.length > 0 && used + line.length + 1 > MEMO_BUDGET) break;
+    used += line.length + 1;
+    keptNewestFirst.push(m);
+  }
+  const kept = keptNewestFirst.reverse().map((m) => makeLine(m.id, m.kind, m.payload, m.ts));
   // Preserve human lines (trimming a trailing blank line so the memo doesn't
   // accumulate empty lines over many writes).
   const humans = others.filter((l, i) => !(l === "" && i === others.length - 1));

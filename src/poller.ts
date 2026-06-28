@@ -36,6 +36,7 @@ import {
   commandLine,
   pendingCommands,
   pendingQuestions,
+  pruneMemo,
   questionLine,
   replyLine,
 } from "./lib/protocol";
@@ -100,17 +101,40 @@ export class Poller {
   async alarm(): Promise<void> {
     try {
       await this.poll();
-    } catch (e) {
-      console.error("[poller] error:", e instanceof Error ? e.message : e);
-    } finally {
-      // self-chaining: schedule the next poll only after this one finishes (doc §7)
+      await this.state.storage.delete("failCount"); // reset backoff on success
       await this.state.storage.setAlarm(Date.now() + POLL_INTERVAL_MS);
+    } catch (e) {
+      // Back off on failure (esp. Touchgym login throttling) so we don't hammer
+      // the login endpoint every 2s and keep a temporary lockout alive.
+      const n = ((await this.state.storage.get<number>("failCount")) ?? 0) + 1;
+      await this.state.storage.put("failCount", n);
+      const backoff = Math.min(600_000, 15_000 * 2 ** (n - 1)); // 15s,30s,60s,... cap 10min
+      console.error(
+        `[poller] error (fail #${n}, retry in ${Math.round(backoff / 1000)}s):`,
+        e instanceof Error ? e.message : e,
+      );
+      await this.state.storage.setAlarm(Date.now() + backoff);
     }
   }
 
+  // Log in and persist the session so a DO restart (e.g. every redeploy) reuses
+  // it instead of forcing a fresh login — which is what triggers Touchgym's
+  // login rate-limit (doc §10-7: cache the session, re-login only on expiry).
+  private async login(): Promise<TouchgymSession> {
+    const s = await touchgymLogin(this.creds);
+    this.session = s;
+    await this.state.storage.put("session", s);
+    return s;
+  }
+
   private async ensureSession(): Promise<TouchgymSession> {
-    if (!this.session) this.session = await touchgymLogin(this.creds);
-    return this.session;
+    if (this.session) return this.session;
+    const stored = await this.state.storage.get<TouchgymSession>("session");
+    if (stored?.sid && stored?.appOrigin) {
+      this.session = stored; // reuse across restarts, no login
+      return stored;
+    }
+    return this.login();
   }
 
   // Fresh GET of the member form + memo, re-logging in once on expiry (doc §10-7).
@@ -121,8 +145,8 @@ export class Poller {
       return { html, memo: extractMemo(html) };
     } catch (e) {
       if (e instanceof SessionExpiredError) {
-        this.session = await touchgymLogin(this.creds);
-        const html = await readMemberHtml(this.session, seq);
+        const s = await this.login();
+        const html = await readMemberHtml(s, seq);
         return { html, memo: extractMemo(html) };
       }
       throw e;
@@ -170,7 +194,10 @@ export class Poller {
     const { memo } = await this.readFresh();
     const commands = pendingCommands(memo);
     const questions = pendingQuestions(memo);
-    if (commands.length === 0 && questions.length === 0) return;
+    // Also rewrite if the memo has grown past the budget, so it stays under
+    // Touchgym's 65535-byte field limit (otherwise new questions get truncated).
+    const needShrink = pruneMemo(memo) !== memo;
+    if (commands.length === 0 && questions.length === 0 && !needShrink) return;
 
     const lines: string[] = [];
 
@@ -197,8 +224,12 @@ export class Poller {
     }
 
     // Fresh read-modify-write right before writing, then one form-preserving POST
-    // that appends all lines and prunes the 2-day window (doc §5/§8).
+    // that appends new lines and prunes (time + size budget, doc §5/§8). Skip the
+    // write if nothing changed (e.g. another writer already shrank it).
     const { html, memo: fresh } = await this.readFresh();
-    await writeMemo(await this.ensureSession(), this.env.TOUCHGYM_SEQ, html, appendToMemo(fresh, lines));
+    const next = appendToMemo(fresh, lines);
+    if (next !== fresh) {
+      await writeMemo(await this.ensureSession(), this.env.TOUCHGYM_SEQ, html, next);
+    }
   }
 }
