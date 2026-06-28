@@ -4,9 +4,21 @@ A search-grounded LLM assistant that talks **entirely through the Touchgym membe
 
 Built for an environment that can reach **only touchgym.co.kr**. You write a question into the
 member memo (via a console helper), and an always-on Cloudflare Worker — which *can* reach
-touchgym — **polls that memo every 2 seconds**, answers new questions with **Gemini 3.5 Flash +
-native Google Search grounding**, and writes the answer back into the memo. Your console reads it
-back and prints it.
+touchgym — **polls that memo every 2 seconds**, answers new questions with a **web-search-grounded
+LLM**, and writes the answer back into the memo. Your console reads it back and prints it.
+
+The model is selectable from the console across **three providers** — *any* model each provider runs,
+addressed as `provider:model`. `models()` shows the live catalog (Gemini + Ollama fetched on demand,
+Cloudflare from an embedded list), marking 🔍 = web-search-capable and ▶ = current.
+
+| Provider (`prefix`) | Catalog | Search |
+|---------------------|---------|--------|
+| **Gemini API** (`gemini:`) | live `/v1beta/models` (chat models) | native Google Search grounding (all) |
+| **Cloudflare Workers AI** (`cf:`) | embedded text-gen list | `web_search_options` (Kimi/Nemotron/GLM/GPT-OSS) |
+| **Ollama Cloud** (`ollama:`) | live `/api/tags` (your account) | Ollama web search API + RAG (all) |
+
+> 🔍 means the model *can* search; weaker models may not always invoke it. For reliably grounded
+> answers prefer strong models (`gemini:gemini-3.5-flash`, `ollama:gpt-oss:120b`, `cf:@cf/moonshotai/kimi-k2.6`).
 
 See `touchgym-integration.md` for the underlying technique (memo as a message bus, multi-hop
 login, form-preserving writes, single-writer rule).
@@ -32,12 +44,13 @@ login, form-preserving writes, single-writer rule).
 The console never contacts the worker; both sides communicate purely through the memo. The worker
 runs autonomously, so once deployed it keeps polling 24/7.
 
-- `src/poller.ts` — the Durable Object: 2s alarm loop, cached session, single writer for answers
+- `src/poller.ts` — the Durable Object: 2s alarm loop, cached session, single writer; selected model in DO storage; dispatches to the provider
 - `src/lib/touchgym.ts` — login, read, form-preserving write, session cache (doc §3/§4/§5/§10-7)
-- `src/lib/protocol.ts` — `TGPT1|id|kind|ts|b64url(payload)` lines, prune to yesterday+today KST (doc §8)
-- `src/lib/gemini.ts` — Gemini 3.5 Flash with Google Search grounding (Interactions API, generateContent fallback)
+- `src/lib/protocol.ts` — `TGPT1|id|kind|ts|b64url(payload)` lines (`q`/`a` + `c`/`r` control channel), prune to yesterday+today KST (doc §8)
+- `src/lib/models.ts` — `provider:model` addressing + live catalog (Gemini/Ollama fetched, Cloudflare embedded)
+- `src/lib/gemini.ts` / `src/lib/workersai.ts` / `src/lib/ollama.ts` — the three provider clients (all web-search-grounded)
 - `src/index.ts` — Hono app: `GET /start` (arm poller), `GET /debug/ask|/debug/memo|/ask|/memo` (token-guarded)
-- `console/touchgpt.js` — the browser console client
+- `console/touchgpt.js` — the browser console client (`ask`, `models`, `setModel`)
 
 ## Setup
 
@@ -45,7 +58,8 @@ runs autonomously, so once deployed it keeps polling 24/7.
 
 | Key | Where | Purpose |
 |-----|-------|---------|
-| `GEMINI_API_KEY` | secret | Gemini 3.5 Flash (Google AI Studio key) |
+| `GEMINI_API_KEY` | secret | Gemini models (Google AI Studio key) |
+| `OLLAMA_API_KEY` | secret | Ollama Cloud models + web search (ollama.com key) |
 | `TOUCHGYM_CLUB_ID` / `TOUCHGYM_USERID` / `TOUCHGYM_PASSWORD` | secret | Touchgym admin login (field names per doc §3.2) |
 | `TOUCHGYM_SEQ` | var | mailbox member `seq` that **really exists in this club/shard** (doc §10-3) |
 | `TOUCHGPT_TOKEN` | secret | token guarding the debug endpoints |
@@ -54,6 +68,7 @@ Local dev: `.dev.vars` (gitignored). Production:
 
 ```sh
 wrangler secret put GEMINI_API_KEY
+wrangler secret put OLLAMA_API_KEY
 wrangler secret put TOUCHGYM_CLUB_ID
 wrangler secret put TOUCHGYM_USERID
 wrangler secret put TOUCHGYM_PASSWORD
@@ -84,9 +99,14 @@ curl "https://<your-worker>.workers.dev/start"
 
 ```js
 ask("2024 파리 올림픽 양궁 남자 단체전 금메달 국가는?")
+
+models()                              // live catalog, grouped by provider (▶ current, 🔍 web search)
+setModel("ollama:gpt-oss:120b")       // switch model — provider:model (gemini: / cf: / ollama:)
 ```
 
-It writes the question into the memo, polls every 2s, and prints the worker's answer with citations.
+All three commands go through the memo channel (the console never contacts the worker). `ask` writes
+the question, polls every 2s, and prints the worker's answer with citations. `models`/`setModel` send
+a control line that the poller reads, applies (the selection persists in the DO), and replies to.
 
 ## Debug endpoints (token-guarded)
 

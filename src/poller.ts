@@ -9,6 +9,17 @@
 
 import type { Bindings } from "./env";
 import { askGemini } from "./lib/gemini";
+import { askWorkersAI } from "./lib/workersai";
+import { askOllama } from "./lib/ollama";
+import {
+  DEFAULT_REF,
+  type ModelRef,
+  cfSupportsWebSearch,
+  fetchCatalog,
+  formatRef,
+  parseModelRef,
+  refTitle,
+} from "./lib/models";
 import {
   SessionExpiredError,
   type TouchgymCreds,
@@ -18,7 +29,16 @@ import {
   touchgymLogin,
   writeMemo,
 } from "./lib/touchgym";
-import { answerLine, appendToMemo, pendingQuestions, questionLine } from "./lib/protocol";
+import {
+  type AnswerPayload,
+  answerLine,
+  appendToMemo,
+  commandLine,
+  pendingCommands,
+  pendingQuestions,
+  questionLine,
+  replyLine,
+} from "./lib/protocol";
 
 const POLL_INTERVAL_MS = 2000;
 
@@ -45,8 +65,9 @@ export class Poller {
   async fetch(req: Request): Promise<Response> {
     const action = new URL(req.url).searchParams.get("action") ?? "kick";
     if (action === "ask") {
-      const q = new URL(req.url).searchParams.get("q") ?? "";
-      const id = await this.injectQuestion(q);
+      const sp = new URL(req.url).searchParams;
+      const kind = sp.get("kind") === "c" ? "c" : "q";
+      const id = await this.injectLine(kind, sp.get("q") ?? "");
       await this.armAlarm();
       return Response.json({ id });
     }
@@ -63,11 +84,16 @@ export class Poller {
       await this.state.storage.setAlarm(Date.now() + 50);
   }
 
-  private async injectQuestion(question: string): Promise<string> {
+  private async injectLine(kind: "q" | "c", text: string): Promise<string> {
     const { html, memo } = await this.readFresh();
     const id = crypto.randomUUID();
-    const next = appendToMemo(memo, [questionLine(id, question)]);
-    await writeMemo(await this.ensureSession(), this.env.TOUCHGYM_SEQ, html, next);
+    const line = kind === "c" ? commandLine(id, text) : questionLine(id, text);
+    await writeMemo(
+      await this.ensureSession(),
+      this.env.TOUCHGYM_SEQ,
+      html,
+      appendToMemo(memo, [line]),
+    );
     return id;
   }
 
@@ -103,17 +129,67 @@ export class Poller {
     }
   }
 
+  private async currentRef(): Promise<ModelRef> {
+    const raw = await this.state.storage.get<string>("modelref");
+    if (raw) {
+      try {
+        const r = JSON.parse(raw) as ModelRef;
+        if (r?.provider && r?.model) return r;
+      } catch {
+        /* fall through to default */
+      }
+    }
+    return DEFAULT_REF;
+  }
+
+  private async answer(question: string, ref: ModelRef): Promise<AnswerPayload> {
+    if (ref.provider === "workers-ai")
+      return askWorkersAI(question, ref.model, this.env.AI, cfSupportsWebSearch(ref.model));
+    if (ref.provider === "ollama") return askOllama(question, ref.model, this.env.OLLAMA_API_KEY);
+    return askGemini(question, this.env.GEMINI_API_KEY, ref.model);
+  }
+
+  private async handleCommand(command: string): Promise<string> {
+    const parts = command.trim().split(/\s+/);
+    const cmd = (parts[0] ?? "").toLowerCase();
+    const cur = await this.currentRef();
+    if (cmd === "listmodels")
+      return 'setModel("provider:model") 로 선택:\n' + (await fetchCatalog(this.env, cur));
+    if (cmd === "model") return `현재 모델: ${refTitle(cur)} (${formatRef(cur)})`;
+    if (cmd === "setmodel") {
+      const ref = parseModelRef(parts.slice(1).join(" ").trim());
+      if (!ref)
+        return '❌ 형식: setModel("provider:model")\n  예) gemini:gemini-2.5-pro · cf:@cf/moonshotai/kimi-k2.6 · ollama:gpt-oss:120b';
+      await this.state.storage.put("modelref", JSON.stringify(ref));
+      return `✅ 모델 변경됨 → ${refTitle(ref)} (${formatRef(ref)})`;
+    }
+    return `알 수 없는 명령: ${command}`;
+  }
+
   private async poll(): Promise<void> {
     const { memo } = await this.readFresh();
-    const pending = pendingQuestions(memo);
-    if (pending.length === 0) return;
+    const commands = pendingCommands(memo);
+    const questions = pendingQuestions(memo);
+    if (commands.length === 0 && questions.length === 0) return;
 
-    // Answer each pending question. On failure, store the error AS the answer so
-    // it isn't retried every 2s forever and the user can see what went wrong.
     const lines: string[] = [];
-    for (const { id, question } of pending) {
+
+    // Handle commands first (e.g. model switch) so a following question in the
+    // same batch already uses the new model.
+    for (const { id, command } of commands) {
       try {
-        lines.push(answerLine(id, await askGemini(question, this.env.GEMINI_API_KEY)));
+        lines.push(replyLine(id, await this.handleCommand(command)));
+      } catch (e) {
+        lines.push(replyLine(id, "⚠️ 명령 오류: " + (e instanceof Error ? e.message : String(e))));
+      }
+    }
+
+    // Answer each pending question with the currently selected model. On failure,
+    // store the error AS the answer so it isn't retried every 2s forever.
+    const ref = await this.currentRef();
+    for (const { id, question } of questions) {
+      try {
+        lines.push(answerLine(id, await this.answer(question, ref)));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         lines.push(answerLine(id, { text: "⚠️ 오류: " + msg, citations: [] }));
@@ -121,7 +197,7 @@ export class Poller {
     }
 
     // Fresh read-modify-write right before writing, then one form-preserving POST
-    // that appends all answers and prunes the 2-day window (doc §5/§8).
+    // that appends all lines and prunes the 2-day window (doc §5/§8).
     const { html, memo: fresh } = await this.readFresh();
     await writeMemo(await this.ensureSession(), this.env.TOUCHGYM_SEQ, html, appendToMemo(fresh, lines));
   }

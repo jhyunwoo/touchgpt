@@ -9,6 +9,8 @@
 //   TGPT1|<id>|<kind>|<tsMs>|<payloadB64url>
 //   kind = "q" (question)  payload = b64url(questionText)
 //   kind = "a" (answer)    payload = b64url(JSON.stringify({ text, citations }))
+//   kind = "c" (command)   payload = b64url(commandText)   e.g. "setmodel kimi-k2.6"
+//   kind = "r" (reply)     payload = b64url(JSON.stringify({ text, citations }))
 //
 // The payload is the LAST field and base64url-encoded, so it can never contain
 // the `|` separator or a newline — restore it with slice(4).join("|").
@@ -25,9 +27,11 @@ export interface AnswerPayload {
   citations: Citation[];
 }
 
+export type Kind = "q" | "a" | "c" | "r";
+
 export interface Msg {
   id: string;
-  kind: "q" | "a";
+  kind: Kind;
   ts: number;
   payload: string; // still base64url-encoded
 }
@@ -67,7 +71,7 @@ export function parseMemo(memo: string): { msgs: Msg[]; others: string[] } {
       continue;
     }
     const kind = parts[2];
-    if (kind !== "q" && kind !== "a") {
+    if (kind !== "q" && kind !== "a" && kind !== "c" && kind !== "r") {
       others.push(raw);
       continue;
     }
@@ -81,7 +85,7 @@ export function parseMemo(memo: string): { msgs: Msg[]; others: string[] } {
   return { msgs, others };
 }
 
-function makeLine(id: string, kind: "q" | "a", payload: string, ts: number): string {
+function makeLine(id: string, kind: Kind, payload: string, ts: number): string {
   return `${PREFIX}|${id}|${kind}|${ts}|${payload}`;
 }
 
@@ -135,4 +139,25 @@ export function findAnswer(memo: string, id: string): AnswerPayload | null {
   const { msgs } = parseMemo(memo);
   const a = msgs.find((m) => m.kind === "a" && m.id === id);
   return a ? (JSON.parse(b64urlDecode(a.payload)) as AnswerPayload) : null;
+}
+
+// --- control channel: commands (console → worker) and replies (worker → console)
+
+/** Build a command line (e.g. "setmodel kimi-k2.6", "listmodels"). */
+export function commandLine(id: string, command: string, now = Date.now()): string {
+  return makeLine(id, "c", b64urlEncode(command), now);
+}
+
+/** Build a reply line. Reuses AnswerPayload so the console decodes it uniformly. */
+export function replyLine(id: string, text: string, now = Date.now()): string {
+  return makeLine(id, "r", b64urlEncode(JSON.stringify({ text, citations: [] })), now);
+}
+
+/** Command lines (id + decoded text) that don't yet have a matching reply. */
+export function pendingCommands(memo: string): { id: string; command: string }[] {
+  const { msgs } = parseMemo(memo);
+  const replied = new Set(msgs.filter((m) => m.kind === "r").map((m) => m.id));
+  return msgs
+    .filter((m) => m.kind === "c" && !replied.has(m.id))
+    .map((m) => ({ id: m.id, command: b64urlDecode(m.payload) }));
 }

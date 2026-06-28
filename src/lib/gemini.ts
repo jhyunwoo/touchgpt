@@ -7,10 +7,13 @@
 
 import type { AnswerPayload, Citation } from "./protocol";
 
-const MODEL = "gemini-3.5-flash";
 const BASE = "https://generativelanguage.googleapis.com/v1beta";
 
-export async function askGemini(question: string, apiKey: string): Promise<AnswerPayload> {
+export async function askGemini(
+  question: string,
+  apiKey: string,
+  model = "gemini-3.5-flash",
+): Promise<AnswerPayload> {
   // Try the Interactions API first (nicer citation shape). It rejects some
   // keys/projects, so on ANY failure fall back to the stable generateContent
   // endpoint (both use the google_search grounding tool).
@@ -18,13 +21,13 @@ export async function askGemini(question: string, apiKey: string): Promise<Answe
     const res = await fetch(`${BASE}/interactions`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-      body: JSON.stringify({ model: MODEL, input: question, tools: [{ type: "google_search" }] }),
+      body: JSON.stringify({ model, input: question, tools: [{ type: "google_search" }] }),
     });
     if (res.ok) return parseInteraction(await res.json());
   } catch {
     /* network error — fall back */
   }
-  return askGeminiGenerateContent(question, apiKey);
+  return askGeminiGenerateContent(question, apiKey, model);
 }
 
 // --- Interactions response parsing ------------------------------------------
@@ -88,8 +91,12 @@ interface GenContentResponse {
   }[];
 }
 
-async function askGeminiGenerateContent(question: string, apiKey: string): Promise<AnswerPayload> {
-  const res = await fetch(`${BASE}/models/${MODEL}:generateContent`, {
+async function askGeminiGenerateContent(
+  question: string,
+  apiKey: string,
+  model = "gemini-3.5-flash",
+): Promise<AnswerPayload> {
+  const res = await fetch(`${BASE}/models/${model}:generateContent`, {
     method: "POST",
     headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
     body: JSON.stringify({

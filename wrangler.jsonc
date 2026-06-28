@@ -16,6 +16,8 @@
     "bindings": [{ "name": "POLLER", "class_name": "Poller" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Poller"] }],
+  // Workers AI — for the Cloudflare models (built-in web_search_options).
+  "ai": { "binding": "AI" },
   // 1-minute heartbeat that re-arms the poller's alarm if it ever stops.
   "triggers": {
     "crons": ["* * * * *"]

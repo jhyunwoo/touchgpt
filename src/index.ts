@@ -39,7 +39,10 @@ app.get("/debug/ask", async (c) => {
   if (c.req.query("token") !== c.env.TOUCHGPT_TOKEN) return c.json({ error: "unauthorized" }, 401);
   const q = c.req.query("q");
   if (!q) return c.json({ error: "missing q" }, 400);
-  const res = await pollerStub(c.env).fetch("https://poller/?action=ask&q=" + encodeURIComponent(q));
+  const kind = c.req.query("kind") === "c" ? "&kind=c" : "";
+  const res = await pollerStub(c.env).fetch(
+    "https://poller/?action=ask&q=" + encodeURIComponent(q) + kind,
+  );
   return c.json(await res.json());
 });
 

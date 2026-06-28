@@ -67,8 +67,9 @@
     return ta ? ta.value : "";
   }
 
-  // --- write a question line, preserving the whole form (doc §5.1/§5.3) --
-  async function writeQuestion(question) {
+  // --- write a TGPT line (question or command), preserving the whole form
+  //     (doc §5.1/§5.3) ----------------------------------------------------
+  async function writeLine(kind, text) {
     const doc = await fetchDoc(); // fresh form
     const form = doc.querySelector('form[name="form"]') || doc;
     const fields = {};
@@ -92,7 +93,7 @@
     const id = crypto.randomUUID
       ? crypto.randomUUID()
       : Date.now().toString(36) + Math.random().toString(16).slice(2);
-    const line = [PREFIX, id, "q", Date.now(), b64urlEncode(question)].join("|");
+    const line = [PREFIX, id, kind, Date.now(), b64urlEncode(text)].join("|");
     const memo = fields["memo"] ? fields["memo"] + "\n" + line : line;
     fields["memo"] = memo;
     fields["seq2"] = fields["seq2"] || SEQ;
@@ -105,15 +106,17 @@
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
     });
-    if (res.status >= 400) throw new Error("질문 저장 실패: HTTP " + res.status);
+    if (res.status >= 400) throw new Error("memo 저장 실패: HTTP " + res.status);
     return id;
   }
 
-  function findAnswer(doc, id) {
+  // Find the worker's reply line for a given id: kind "a" for a question,
+  // "r" for a command. Both carry a JSON {text, citations} payload.
+  function findReply(doc, id, kind) {
     for (const raw of memoOf(doc).split(/\r?\n/)) {
       if (!raw.startsWith(PREFIX + "|")) continue;
       const parts = raw.split("|");
-      if (parts.length < 5 || parts[1] !== id || parts[2] !== "a") continue;
+      if (parts.length < 5 || parts[1] !== id || parts[2] !== kind) continue;
       try {
         return JSON.parse(b64urlDecode(parts.slice(4).join("|")));
       } catch {
@@ -124,11 +127,11 @@
   }
 
   // self-chaining poll: one in-flight request at a time (doc §7), 2s cadence
-  async function pollAnswer(id, tries = 90, intervalMs = 2000) {
+  async function pollReply(id, kind, tries = 90, intervalMs = 2000) {
     for (let i = 0; i < tries; i++) {
       try {
-        const ans = findAnswer(await fetchDoc(), id);
-        if (ans) return ans;
+        const r = findReply(await fetchDoc(), id, kind);
+        if (r) return r;
       } catch {
         /* transient — retry */
       }
@@ -155,20 +158,55 @@
     }
     let id;
     try {
-      id = await writeQuestion(question);
+      id = await writeLine("q", question);
     } catch (e) {
       console.error("[TouchGPT] 질문 등록 실패:", e);
       return;
     }
     console.log("%c[TouchGPT] 질문 등록 완료. 워커 답변 대기 중…(최대 3분)", "color:#888", question);
 
-    const ans = await pollAnswer(id);
+    const ans = await pollReply(id, "a");
     if (!ans) {
       console.warn("[TouchGPT] 시간 내 답변이 도착하지 않았어요. 워커(poller)가 실행 중인지 확인하세요.");
       return;
     }
     printAnswer(question, ans);
     return ans;
+  }
+
+  // --- model controls (also go through the memo channel) -----------------
+  async function sendCommand(command, waitTries) {
+    let id;
+    try {
+      id = await writeLine("c", command);
+    } catch (e) {
+      console.error("[TouchGPT] 명령 전송 실패:", e);
+      return null;
+    }
+    const r = await pollReply(id, "r", waitTries || 30, 2000);
+    if (!r) {
+      console.warn("[TouchGPT] 워커 응답이 없습니다 (poller 실행 여부 확인).");
+      return null;
+    }
+    return r;
+  }
+
+  async function models() {
+    const r = await sendCommand("listmodels");
+    if (r) console.log("%c" + r.text, "color:#2563eb;white-space:pre");
+    return r && r.text;
+  }
+
+  async function setModel(spec) {
+    if (typeof spec !== "string" || !spec.trim()) {
+      console.warn('사용법: setModel("provider:model")  ·  목록 보기: models()\n' +
+        '  예) gemini:gemini-2.5-pro · cf:@cf/moonshotai/kimi-k2.6 · ollama:gpt-oss:120b');
+      return;
+    }
+    console.log("%c[TouchGPT] 모델 변경 요청…", "color:#888", spec);
+    const r = await sendCommand("setmodel " + spec.trim());
+    if (r) console.log("%c" + r.text, "color:#2563eb;white-space:pre");
+    return r && r.text;
   }
 
   // --- tame the page's SSL heartbeat for long sessions (doc §9) ----------
@@ -191,9 +229,15 @@
 
   // --- expose + greet ----------------------------------------------------
   window.ask = ask;
-  window.touchgpt = { ask, readMemo: async () => memoOf(await fetchDoc()) };
+  window.models = models;
+  window.setModel = setModel;
+  window.touchgpt = { ask, models, setModel, readMemo: async () => memoOf(await fetchDoc()) };
   console.log(
-    "%c[TouchGPT] 준비 완료 (memo 채널). 사용법:  ask(\"질문 내용\")",
-    "color:#2563eb;font-weight:bold",
+    "%c[TouchGPT] 준비 완료 (memo 채널).\n" +
+      '  ask("질문 내용")              — 질문하기\n' +
+      "  models()                      — 전체 모델 목록(▶현재, 🔍웹검색)\n" +
+      '  setModel("gemini:gemini-2.5-pro")  — 모델 변경 (provider:model)\n' +
+      "       provider = gemini · cf · ollama",
+    "color:#2563eb;font-weight:bold;white-space:pre",
   );
 })();
