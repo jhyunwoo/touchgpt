@@ -1,0 +1,108 @@
+# TouchGPT
+
+A search-grounded LLM assistant that talks **entirely through the Touchgym member `memo` field**.
+
+Built for an environment that can reach **only touchgym.co.kr**. You write a question into the
+member memo (via a console helper), and an always-on Cloudflare Worker — which *can* reach
+touchgym — **polls that memo every 2 seconds**, answers new questions with **Gemini 3.5 Flash +
+native Google Search grounding**, and writes the answer back into the memo. Your console reads it
+back and prints it.
+
+See `touchgym-integration.md` for the underlying technique (memo as a message bus, multi-hop
+login, form-preserving writes, single-writer rule).
+
+## Architecture
+
+```
+[browser console]  ask("질문")
+   │ writes a TGPT question line into the member memo   (form-preserving; touchgym only)
+   ▼
+( Touchgym member memo )  ◀── polled every 2s ──┐
+   ▲                                            │
+   │ writes the answer line back                │
+[Cloudflare Worker — Durable Object "Poller", pinned to APAC]
+   • alarm() every 2s: login (cached) → read memo → for each unanswered question:
+       Gemini 3.5 Flash + google_search → write answer line (form-preserving, prune 2-day KST)
+   • 1-min cron heartbeat re-arms the alarm if it ever stops (doc §7)
+   • single DO instance = single writer for answers (doc §6)
+   ▼
+[browser console]  polls the memo (read-only) → finds the answer line → prints answer + citations
+```
+
+The console never contacts the worker; both sides communicate purely through the memo. The worker
+runs autonomously, so once deployed it keeps polling 24/7.
+
+- `src/poller.ts` — the Durable Object: 2s alarm loop, cached session, single writer for answers
+- `src/lib/touchgym.ts` — login, read, form-preserving write, session cache (doc §3/§4/§5/§10-7)
+- `src/lib/protocol.ts` — `TGPT1|id|kind|ts|b64url(payload)` lines, prune to yesterday+today KST (doc §8)
+- `src/lib/gemini.ts` — Gemini 3.5 Flash with Google Search grounding (Interactions API, generateContent fallback)
+- `src/index.ts` — Hono app: `GET /start` (arm poller), `GET /debug/ask|/debug/memo|/ask|/memo` (token-guarded)
+- `console/touchgpt.js` — the browser console client
+
+## Setup
+
+### 1. Secrets
+
+| Key | Where | Purpose |
+|-----|-------|---------|
+| `GEMINI_API_KEY` | secret | Gemini 3.5 Flash (Google AI Studio key) |
+| `TOUCHGYM_CLUB_ID` / `TOUCHGYM_USERID` / `TOUCHGYM_PASSWORD` | secret | Touchgym admin login (field names per doc §3.2) |
+| `TOUCHGYM_SEQ` | var | mailbox member `seq` that **really exists in this club/shard** (doc §10-3) |
+| `TOUCHGPT_TOKEN` | secret | token guarding the debug endpoints |
+
+Local dev: `.dev.vars` (gitignored). Production:
+
+```sh
+wrangler secret put GEMINI_API_KEY
+wrangler secret put TOUCHGYM_CLUB_ID
+wrangler secret put TOUCHGYM_USERID
+wrangler secret put TOUCHGYM_PASSWORD
+wrangler secret put TOUCHGPT_TOKEN
+# TOUCHGYM_SEQ is non-secret — set in wrangler.jsonc "vars"
+```
+
+> **Note:** the worker calls Touchgym (legacy TLS) and Gemini. Local `wrangler dev` (workerd) can't
+> complete Touchgym's TLS handshake and isn't in a Gemini-supported region, so **test on the real
+> edge** (`wrangler dev --remote` or `wrangler deploy`). The Durable Object is pinned to APAC so its
+> egress is Gemini-supported.
+
+### 2. Deploy
+
+```sh
+npm install
+npm run deploy
+# then arm the poller (otherwise it self-arms within ~1 min via cron):
+curl "https://<your-worker>.workers.dev/start"
+```
+
+### 3. Console client
+
+1. Edit `console/touchgpt.js` → set `SEQ` to the same member seq the worker polls (`TOUCHGYM_SEQ`).
+2. Log into Touchgym, open the member page (`https://wN.touchgym.co.kr/m/member/...`).
+3. Paste the whole file into the DevTools Console.
+4. Ask:
+
+```js
+ask("2024 파리 올림픽 양궁 남자 단체전 금메달 국가는?")
+```
+
+It writes the question into the memo, polls every 2s, and prints the worker's answer with citations.
+
+## Debug endpoints (token-guarded)
+
+- `GET /ask?q=...&token=...` — Gemini-only (no Touchgym)
+- `GET /memo?token=...` — login + read the mailbox memo, report preserved form-field count
+- `GET /debug/ask?q=...&token=...` — inject a question through the DO (mimics the console)
+- `GET /debug/memo?token=...` — dump the current memo + pending questions, via the DO
+
+## Notes & caveats
+
+- **Single writer (doc §6):** the DO is the only writer for answers. The console also writes
+  questions (form-preserving), so for one user asking serially it's safe; the small two-writer race
+  only risks losing a memo line, never member data (both preserve all form fields, doc §5.1).
+- **Volatile memo (doc §8):** Touchgym keeps only "yesterday + today" (KST); old lines are pruned on
+  each write. The memo is a transient channel/transcript, not durable storage.
+- **Polling load:** the DO re-uses one cached session and reads every 2s; it only re-logs-in on
+  expiry to avoid Touchgym login throttling.
+- **Security (doc §11):** the login is a gym **admin** account — keep all secrets server-side. The
+  memo is plaintext to any club admin. Use only on clubs/accounts you are authorized to access.

@@ -1,0 +1,52 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "touchgpt",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-27",
+  // Non-secret config. The mailbox member seq (doc §10-3) — a real member that
+  // exists in this club/shard. Secrets (GEMINI_API_KEY, TOUCHGYM_CLUB_ID/USERID/
+  // PASSWORD, TOUCHGPT_TOKEN) go in .dev.vars locally and `wrangler secret put`
+  // in prod — never here.
+  "vars": {
+    "TOUCHGYM_SEQ": "5971817"
+  },
+  // Single Durable Object instance that polls the memo every 2s and is the sole
+  // writer for answers (doc §6/§7).
+  "durable_objects": {
+    "bindings": [{ "name": "POLLER", "class_name": "Poller" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Poller"] }],
+  // 1-minute heartbeat that re-arms the poller's alarm if it ever stops.
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  "observability": {
+    "enabled": true
+  },
+  // "kv_namespaces": [
+  //   {
+  //     "binding": "MY_KV_NAMESPACE",
+  //     "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  //   }
+  // ],
+  // "r2_buckets": [
+  //   {
+  //     "binding": "MY_BUCKET",
+  //     "bucket_name": "my-bucket"
+  //   }
+  // ],
+  // "d1_databases": [
+  //   {
+  //     "binding": "MY_DB",
+  //     "database_name": "my-database",
+  //     "database_id": ""
+  //   }
+  // ],
+  // "ai": {
+  //   "binding": "AI"
+  // },
+  // "observability": {
+  //   "enabled": true,
+  //   "head_sampling_rate": 1
+  // }
+}
