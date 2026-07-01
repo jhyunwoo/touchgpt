@@ -11,6 +11,7 @@ import type { Bindings } from "./env";
 import { askGemini } from "./lib/gemini";
 import { askWorkersAI } from "./lib/workersai";
 import { askOllama } from "./lib/ollama";
+import { askOpenAICompat } from "./lib/openaiCompat";
 import {
   DEFAULT_REF,
   type ModelRef,
@@ -42,6 +43,17 @@ import {
 } from "./lib/protocol";
 
 const POLL_INTERVAL_MS = 2000;
+const QUIET_RECHECK_MS = 5 * 60 * 1000; // during quiet hours, just re-check the clock
+
+// User-requested quiet hours (KST): do NOT pull from Touchgym on weekends, or
+// daily from 20:30 to 05:00 the next morning.
+function isQuietHours(now = Date.now()): boolean {
+  const kst = new Date(now + 9 * 60 * 60 * 1000); // shift so getUTC* == KST
+  const day = kst.getUTCDay(); // 0=Sun ... 6=Sat
+  if (day === 0 || day === 6) return true; // weekend
+  const mins = kst.getUTCHours() * 60 + kst.getUTCMinutes();
+  return mins >= 20 * 60 + 30 || mins < 5 * 60; // 20:30–05:00
+}
 
 export class Poller {
   private state: DurableObjectState;
@@ -99,6 +111,12 @@ export class Poller {
   }
 
   async alarm(): Promise<void> {
+    if (isQuietHours()) {
+      // Quiet hours: skip Touchgym entirely, just re-check the clock periodically
+      // (this is a pure time check — no network/data pull).
+      await this.state.storage.setAlarm(Date.now() + QUIET_RECHECK_MS);
+      return;
+    }
     try {
       await this.poll();
       await this.state.storage.delete("failCount"); // reset backoff on success
@@ -170,6 +188,26 @@ export class Poller {
     if (ref.provider === "workers-ai")
       return askWorkersAI(question, ref.model, this.env.AI, cfSupportsWebSearch(ref.model));
     if (ref.provider === "ollama") return askOllama(question, ref.model, this.env.OLLAMA_API_KEY);
+    if (ref.provider === "groq")
+      return askOpenAICompat(
+        question,
+        { label: "Groq", baseUrl: "https://api.groq.com/openai/v1", apiKey: this.env.GROQ_API_KEY },
+        ref.model,
+        this.env.OLLAMA_API_KEY,
+        !ref.model.includes("compound"), // compound searches natively; skip RAG
+      );
+    if (ref.provider === "cerebras")
+      return askOpenAICompat(
+        question,
+        {
+          label: "Cerebras",
+          baseUrl: "https://api.cerebras.ai/v1",
+          apiKey: this.env.CEREBRAS_API_KEY,
+          headers: { "X-Cerebras-3rd-Party-Integration": "touchgpt" },
+        },
+        ref.model,
+        this.env.OLLAMA_API_KEY,
+      );
     return askGemini(question, this.env.GEMINI_API_KEY, ref.model);
   }
 

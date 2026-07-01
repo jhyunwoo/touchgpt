@@ -4,7 +4,7 @@
 // their keys; Cloudflare has no list API without a separate token, so its
 // text-generation models are embedded here.
 
-export type Provider = "gemini" | "workers-ai" | "ollama";
+export type Provider = "gemini" | "workers-ai" | "ollama" | "groq" | "cerebras";
 
 export interface ModelRef {
   provider: Provider;
@@ -17,6 +17,16 @@ export const PROVIDER_LABEL: Record<Provider, string> = {
   gemini: "Gemini API",
   "workers-ai": "Cloudflare Workers AI",
   ollama: "Ollama Cloud",
+  groq: "Groq",
+  cerebras: "Cerebras",
+};
+
+const SHORT: Record<Provider, string> = {
+  gemini: "gemini",
+  "workers-ai": "cf",
+  ollama: "ollama",
+  groq: "groq",
+  cerebras: "cerebras",
 };
 
 function normalizeProvider(p: string): Provider | null {
@@ -24,11 +34,13 @@ function normalizeProvider(p: string): Provider | null {
   if (x === "gemini" || x === "google") return "gemini";
   if (x === "cf" || x === "cloudflare" || x === "workers-ai" || x === "workersai") return "workers-ai";
   if (x === "ollama") return "ollama";
+  if (x === "groq") return "groq";
+  if (x === "cerebras" || x === "cb") return "cerebras";
   return null;
 }
 
 function shortProvider(p: Provider): string {
-  return p === "gemini" ? "gemini" : p === "ollama" ? "ollama" : "cf";
+  return SHORT[p];
 }
 
 /** Parse "provider:model" (model may itself contain ":", e.g. ollama:gpt-oss:120b). */
@@ -120,15 +132,41 @@ async function listOllama(apiKey: string): Promise<string[]> {
   }
 }
 
+// OpenAI-style /models (Groq, Cerebras). Drop non-chat models (audio/tts/guard)
+// and Groq's compound systems (they 413 on search-heavy queries).
+const OPENAI_EXCLUDE = /whisper|tts|guard|embedding|audio|moderation|orpheus|compound/i;
+
+async function listOpenAICompat(url: string, apiKey: string): Promise<string[]> {
+  if (!apiKey) return [];
+  try {
+    const r = await fetch(url, { headers: { authorization: `Bearer ${apiKey}` } });
+    if (!r.ok) return [];
+    const j = (await r.json()) as { data?: { id?: string }[] };
+    return (j.data ?? [])
+      .map((m) => m.id ?? "")
+      .filter((id) => id && !OPENAI_EXCLUDE.test(id))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 /** Live catalog grouped by provider, with copy-pasteable "provider:model" ids
  *  (🔍 = web-search-grounded, ▶ = current). */
 export async function fetchCatalog(
-  env: { GEMINI_API_KEY: string; OLLAMA_API_KEY: string },
+  env: {
+    GEMINI_API_KEY: string;
+    OLLAMA_API_KEY: string;
+    GROQ_API_KEY: string;
+    CEREBRAS_API_KEY: string;
+  },
   current: ModelRef,
 ): Promise<string> {
-  const [gemini, ollama] = await Promise.all([
+  const [gemini, ollama, groq, cerebras] = await Promise.all([
     listGemini(env.GEMINI_API_KEY),
     listOllama(env.OLLAMA_API_KEY),
+    listOpenAICompat("https://api.groq.com/openai/v1/models", env.GROQ_API_KEY),
+    listOpenAICompat("https://api.cerebras.ai/v1/models", env.CEREBRAS_API_KEY),
   ]);
   const line = (provider: Provider, model: string, search: boolean) => {
     const cur = current.provider === provider && current.model === model;
@@ -141,5 +179,9 @@ export async function fetchCatalog(
   for (const m of CF_MODELS) out.push(line("workers-ai", m, CF_WEBSEARCH.has(m)));
   out.push("[Ollama Cloud] — 🔍 모두 웹검색(RAG)");
   for (const m of ollama) out.push(line("ollama", m, true));
+  out.push("[Groq] — 🔍 웹검색(RAG)");
+  for (const m of groq) out.push(line("groq", m, true));
+  out.push("[Cerebras] — 🔍 웹검색(RAG)");
+  for (const m of cerebras) out.push(line("cerebras", m, true));
   return out.join("\n");
 }

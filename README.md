@@ -16,6 +16,8 @@ Cloudflare from an embedded list), marking 🔍 = web-search-capable and ▶ = c
 | **Gemini API** (`gemini:`) | live `/v1beta/models` (chat models) | native Google Search grounding (all) |
 | **Cloudflare Workers AI** (`cf:`) | embedded text-gen list | `web_search_options` (Kimi/Nemotron/GLM/GPT-OSS) |
 | **Ollama Cloud** (`ollama:`) | live `/api/tags` (your account) | Ollama web search API + RAG (all) |
+| **Groq** (`groq:`) | live `/openai/v1/models` | Ollama web search + RAG (uses `OLLAMA_API_KEY`) |
+| **Cerebras** (`cerebras:`) | live `/v1/models` | Ollama web search + RAG (uses `OLLAMA_API_KEY`) |
 
 > 🔍 means the model *can* search; weaker models may not always invoke it. For reliably grounded
 > answers prefer strong models (`gemini:gemini-3.5-flash`, `ollama:gpt-oss:120b`, `cf:@cf/moonshotai/kimi-k2.6`).
@@ -59,7 +61,9 @@ runs autonomously, so once deployed it keeps polling 24/7.
 | Key | Where | Purpose |
 |-----|-------|---------|
 | `GEMINI_API_KEY` | secret | Gemini models (Google AI Studio key) |
-| `OLLAMA_API_KEY` | secret | Ollama Cloud models + web search (ollama.com key) |
+| `OLLAMA_API_KEY` | secret | Ollama Cloud models + web search for Ollama/Groq/Cerebras (ollama.com key) |
+| `GROQ_API_KEY` | secret | Groq models (console.groq.com key) |
+| `CEREBRAS_API_KEY` | secret | Cerebras models (cloud.cerebras.ai key) |
 | `TOUCHGYM_CLUB_ID` / `TOUCHGYM_USERID` / `TOUCHGYM_PASSWORD` | secret | Touchgym admin login (field names per doc §3.2) |
 | `TOUCHGYM_SEQ` | var | mailbox member `seq` that **really exists in this club/shard** (doc §10-3) |
 | `TOUCHGPT_TOKEN` | secret | token guarding the debug endpoints |
@@ -69,6 +73,8 @@ Local dev: `.dev.vars` (gitignored). Production:
 ```sh
 wrangler secret put GEMINI_API_KEY
 wrangler secret put OLLAMA_API_KEY
+wrangler secret put GROQ_API_KEY
+wrangler secret put CEREBRAS_API_KEY
 wrangler secret put TOUCHGYM_CLUB_ID
 wrangler secret put TOUCHGYM_USERID
 wrangler secret put TOUCHGYM_PASSWORD
@@ -124,5 +130,8 @@ a control line that the poller reads, applies (the selection persists in the DO)
   each write. The memo is a transient channel/transcript, not durable storage.
 - **Polling load:** the DO re-uses one cached session and reads every 2s; it only re-logs-in on
   expiry to avoid Touchgym login throttling.
+- **Quiet hours (KST):** the poller does not touch Touchgym on weekends, or daily from 20:30 to
+  05:00 — questions asked during these windows are answered once polling resumes (`isQuietHours` in
+  `src/poller.ts`).
 - **Security (doc §11):** the login is a gym **admin** account — keep all secrets server-side. The
   memo is plaintext to any club admin. Use only on clubs/accounts you are authorized to access.
